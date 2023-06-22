@@ -6,6 +6,8 @@
   - `pip install git+https://github.com/inducer/arraycontext@batched_einsum_actx`
 - Install `pytato`:
   - `pip install git+https://github.com/inducer/pytato`
+- Install `loopy`:
+  - `pip install git+https://github.com/inducer/loopy`
 - Install `pyopencl`:
   - `pip install pyopencl`
 - Install `jax`:

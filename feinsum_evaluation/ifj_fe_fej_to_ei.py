@@ -3,6 +3,7 @@ import numpy as np
 from arraycontext import (ArrayContext, ArrayT, tag_axes, PyOpenCLArrayContext,
                           PytatoJAXArrayContext, EagerJAXArrayContext)
 from bidict import bidict
+from tabulate import tabulate
 
 from typing import Sequence, Type
 from pytools.obj_array import make_obj_array
@@ -17,28 +18,50 @@ def kernel(actx: ArrayContext,
            flux_terms_n: Sequence[ArrayT],
            ref_mat: ArrayT,
            jac: ArrayT) -> np.array:
-    ref_mat = tag_axes(actx, ref_mat, {0: NamedAxis("voldof"),
-                                       1: NamedAxis("face"),
-                                       2: NamedAxis("facedof")})
-    jac = tag_axes(actx, jac, {0: NamedAxis("face"),
-                               1: NamedAxis("element")})
+    ref_mat = tag_axes(actx,
+                       {0: NamedAxis("voldof"),
+                        1: NamedAxis("face"),
+                        2: NamedAxis("facedof")},
+                       ref_mat)
+    jac = tag_axes(actx,
+                   {0: NamedAxis("face"),
+                    1: NamedAxis("element")},
+                   jac)
 
-    flux_terms_p = [tag_axes(actx, flux, {0: NamedAxis("face"),
-                                          1: NamedAxis("element"),
-                                          2: NamedAxis("facedof")})
+    flux_terms_p = [tag_axes(actx,
+                             {0: NamedAxis("face"),
+                              1: NamedAxis("element"),
+                              2: NamedAxis("facedof")},
+                             flux)
                     for flux in flux_terms_p]
-    flux_terms_n = [tag_axes(actx, flux, {0: NamedAxis("face"),
-                                          1: NamedAxis("element"),
-                                          2: NamedAxis("facedof")})
+
+    flux_terms_n = [tag_axes(actx,
+                             {0: NamedAxis("face"),
+                              1: NamedAxis("element"),
+                              2: NamedAxis("facedof")},
+                             flux)
                     for flux in flux_terms_n]
 
     sub_results = [
-        actx.np.einsum("ifj,fe,fej->ei",
-                       ref_mat, jac, 0.5 * (flux_n + flux_p))
+        actx.einsum("ifj,fe,fej->ei",
+                    ref_mat, jac, 0.5 * (flux_n + flux_p))
         for flux_p, flux_n in zip(flux_terms_p, flux_terms_n, strict=True)
     ]
 
     return make_obj_array(sub_results)
+
+
+def get_nel(ni: int):
+    if ni == 4:
+        return 200_000
+    elif ni == 10:
+        return 200_000
+    elif ni == 20:
+        return 100_000
+    elif ni == 35:
+        return 80_000
+    else:
+        raise NotImplementedError()
 
 
 def main(*,
@@ -47,8 +70,8 @@ def main(*,
          ni: int,
          nj: int) -> None:
 
-    nel = 200_000
     timings = np.empty((len(batches), len(actx_ts)), dtype=np.float64)
+    nel = get_nel(ni)
 
     # sorting `actx_ts` to run JAX related operations at the end as they only
     # free the device memory atexit
@@ -56,19 +79,19 @@ def main(*,
                                   key=lambda k: get_actx_t_priority(k[1])):
         actx = instantiate_actx_t(actx_t)
         for ibatch, n in enumerate(batches):
-            ref_mat = actx.freeze(actx.from_numpy(np.random.rand(ni, 4, nj)))
-            jac = actx.freeze(actx.from_numpy(np.random.rand(4, nel)))
+            ref_mat = actx.from_numpy(np.random.rand(ni, 4, nj))
+            jac = actx.from_numpy(np.random.rand(4, nel))
             compiled_knl = actx.compile(lambda *args: kernel(actx, *args))
 
             wallclock_time = get_wallclock_time(
                 compiled_knl,
                 (
                     make_obj_array([
-                        actx.from_numpy(np.random.rand(4, nel, nj)
-                                        for _ in range(n))]),
+                        actx.from_numpy(np.random.rand(4, nel, nj))
+                        for _ in range(n)]),
                     make_obj_array([
-                        actx.from_numpy(np.random.rand(4, nel, nj)
-                                        for _ in range(n))]),
+                        actx.from_numpy(np.random.rand(4, nel, nj))
+                        for _ in range(n)]),
                     ref_mat,
                     jac,
                 ),
@@ -76,7 +99,14 @@ def main(*,
 
             timings[ibatch, iactx_t] = wallclock_time
 
-    print(timings)
+    table = [["",
+              *[_NAME_TO_ACTX_CLASS.inv[actx_t]
+                for actx_t in actx_ts]]]
+    for ibatch, n in enumerate(batches):
+        table.append([str(n)] + [f"{timings[ibatch, iactx_t]:.4f}"
+                                 for iactx_t in range(len(actx_ts))])
+
+    print(tabulate(table, tablefmt="fancy_grid"))
 
 
 _NAME_TO_ACTX_CLASS = bidict({

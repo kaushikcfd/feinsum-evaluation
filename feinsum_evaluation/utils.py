@@ -5,7 +5,7 @@ from arraycontext import (
     BatchedEinsumPytatoPyOpenCLArrayContext as BaseBatchedEinsumPytatoPyOpenCLArrayContext  # noqa: E501
 )
 from feinsum_evaluation.metadata import NamedAxis
-from typing import Any, Callable, Mapping, Optional, Type, Tuple
+from typing import Any, Callable, Optional, Type, Tuple
 from time import time
 from pytools.tag import Tag
 
@@ -43,6 +43,7 @@ class BatchedEinsumPytatoPyOpenCLArrayContext(
 
 
 def get_actx_t_priority(actx_t):
+    # lower priority => gets executed first
     if issubclass(actx_t, PytatoJAXArrayContext):
         return 10
     else:
@@ -63,7 +64,7 @@ def instantiate_actx_t(actx_t: Type[ArrayContext]) -> ArrayContext:
         return actx_t(cq, allocator)
     elif issubclass(actx_t, (EagerJAXArrayContext, PytatoJAXArrayContext)):
         import os
-        if os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] != "false":
+        if os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE") != "false":
             raise RuntimeError("environment variable 'XLA_PYTHON_CLIENT_PREALLOCATE'"
                                " is not set 'false'. This is required so that"
                                " backends other than JAX can allocate buffers on the"
@@ -77,8 +78,8 @@ def instantiate_actx_t(actx_t: Type[ArrayContext]) -> ArrayContext:
 
 
 def get_wallclock_time(f: Callable[[...], Any],
-                       args: Tuple[Any, ...],
-                       kwargs: Mapping[str, Any]) -> float:
+                       args: Tuple[Any, ...]) -> float:
+    import gc
 
     # {{{ warmup rounds
 
@@ -87,7 +88,7 @@ def get_wallclock_time(f: Callable[[...], Any],
 
     while i_warmup < 20 and t_warmup < 2:
         t_start = time()
-        f(*args, **kwargs)
+        f(*args)
         t_end = time()
         t_warmup += (t_end - t_start)
         i_warmup += 1
@@ -103,8 +104,10 @@ def get_wallclock_time(f: Callable[[...], Any],
 
         t_start = time()
         for _ in range(40):
-            f(*args, **kwargs)
+            f(*args)
         t_end = time()
+
+        gc.collect()
 
         t_actual += (t_end - t_start)
         i_actual += 40
