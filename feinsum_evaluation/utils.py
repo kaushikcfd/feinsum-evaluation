@@ -1,8 +1,45 @@
-from arraycontext import (ArrayContext, PyOpenCLArrayContext,
-                          PytatoPyOpenCLArrayContext,
-                          EagerJAXArrayContext, PytatoJAXArrayContext)
-from typing import Any, Callable, Mapping, Type, Tuple
+from arraycontext import (
+    ArrayContext, PyOpenCLArrayContext,
+    PytatoPyOpenCLArrayContext,
+    EagerJAXArrayContext, PytatoJAXArrayContext,
+    BatchedEinsumPytatoPyOpenCLArrayContext as BaseBatchedEinsumPytatoPyOpenCLArrayContext  # noqa: E501
+)
+from feinsum_evaluation.metadata import NamedAxis
+from typing import Any, Callable, Mapping, Optional, Type, Tuple
 from time import time
+from pytools.tag import Tag
+
+
+def _fused_loop_name_prefix_getter(tag: Tag) -> str:
+    if isinstance(tag, NamedAxis):
+        return f"i{tag.name}"
+    else:
+        raise NotImplementedError(type(tag))
+
+
+class BatchedEinsumPytatoPyOpenCLArrayContext(
+    BaseBatchedEinsumPytatoPyOpenCLArrayContext
+        ):
+    def __init__(
+        self,
+        queue, allocator=None,
+        *,
+        compile_trace_callback: Optional[Callable[[Any, str, Any], None]] = None,
+        feinsum_db: Optional[str] = None,
+        log_loopy_statistics: bool = False,
+    ) -> None:
+        import feinsum as fnsm
+
+        super().__init__(
+            queue, allocator,
+            loop_fusion_axis_tag_t=NamedAxis,
+            fallback_to_no_fusion=False,
+            assume_all_indirection_maps_as_non_negative=True,
+            compile_trace_callback=compile_trace_callback,
+            feinsum_db=fnsm.DEFAULT_DB,
+            log_loopy_statistics=log_loopy_statistics,
+            fused_loop_name_prefix_getter=_fused_loop_name_prefix_getter
+        )
 
 
 def get_actx_t_priority(actx_t):

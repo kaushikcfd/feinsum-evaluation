@@ -1,15 +1,15 @@
 import argparse
 import numpy as np
 from arraycontext import (ArrayContext, ArrayT, tag_axes, PyOpenCLArrayContext,
-                          PytatoJAXArrayContext, EagerJAXArrayContext,
-                          BatchedEinsumPytatoPyOpenCLArrayContext)
+                          PytatoJAXArrayContext, EagerJAXArrayContext)
 from bidict import bidict
 
 from typing import Sequence, Type
 from pytools.obj_array import make_obj_array
-from .metadata import NamedAxis
-from .utils import (get_actx_t_priority, instantiate_actx_t,
-                    get_wallclock_time)
+from feinsum_evaluation.metadata import NamedAxis
+from feinsum_evaluation.utils import (get_actx_t_priority, instantiate_actx_t,
+                                      get_wallclock_time,
+                                      BatchedEinsumPytatoPyOpenCLArrayContext)
 
 
 def kernel(actx: ArrayContext,
@@ -46,6 +46,7 @@ def main(*,
          batches: Sequence[int],
          ni: int,
          nj: int) -> None:
+
     nel = 200_000
     timings = np.empty((len(batches), len(actx_ts)), dtype=np.float64)
 
@@ -64,10 +65,10 @@ def main(*,
                 (
                     make_obj_array([
                         actx.from_numpy(np.random.rand(4, nel, nj)
-                                        for _ in range(batches))]),
+                                        for _ in range(n))]),
                     make_obj_array([
                         actx.from_numpy(np.random.rand(4, nel, nj)
-                                        for _ in range(batches))]),
+                                        for _ in range(n))]),
                     ref_mat,
                     jac,
                 ),
@@ -115,8 +116,7 @@ if __name__ == "__main__":
                         required=True,)
 
     args = parser.parse_args()
-    main(equations=[k.strip() for k in args.actxs.split(",")],
-         ns=[int(k.strip()) for k in args.batches.split(",")],
+    main(batches=[int(k.strip()) for k in args.batches.split(",")],
          actx_ts=[_NAME_TO_ACTX_CLASS[k] for k in args.actxs.split(",")],
          ni=args.ni,
          nj=args.nj)
