@@ -7,7 +7,7 @@
 - Install `pytato`:
   - `pip install git+https://github.com/inducer/pytato`
 - Install `loopy`:
-  - `pip install git+https://github.com/inducer/loopy`
+  - `pip install git+https://github.com/kaushikcfd/loopy`
 - Install `pyopencl`:
   - `pip install pyopencl`
 - Install `jax`:
