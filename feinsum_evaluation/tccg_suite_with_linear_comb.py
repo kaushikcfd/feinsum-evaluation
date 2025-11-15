@@ -2,119 +2,37 @@ import gc
 from time import time
 
 import feinsum as fnsm
-import islpy as isl
 import loopy as lp
 import numpy as np
-import pytato as pt
+import pyopencl as cl
+import pyopencl.tools as cl_tools
 from arraycontext import (
     Array,
     ArrayContext,
     NumpyArrayContext,
     PytatoJAXArrayContext,
-    PytatoPyOpenCLArrayContext,
 )
 from tabulate import tabulate
 
 N_WARMUP_ROUNDS = 3
 N_MIN_ROUNDS = 10
-
-
-class FeinsumArrayContext(PytatoPyOpenCLArrayContext):
-    def transform_dag(self, dag: pt.DictOfNamedArrays) -> pt.DictOfNamedArrays:
-        # Step 1. Materialize einsum/reduction outputs.
-        # ---------------------------------------------
-        def materialize_all_einsums_or_reduces(expr: pt.Array):
-            if isinstance(expr, pt.Einsum) or (
-                isinstance(expr, pt.IndexLambda) and expr.var_to_reduction_descr
-            ):
-                return expr.tagged(pt.tags.ImplStored())
-            else:
-                return expr
-
-        dag = pt.transform.map_and_copy(dag, materialize_all_einsums_or_reduces)
-
-        # Step 2. Make all pt.einsum/pt.reduction inputs as substitutions
-        # ---------------------------------------------------------------
-        def implement_einsum_reduction_inputs_as_substs(expr):
-            from immutables import Map
-            from pytato.target.loopy import ImplSubstitution
-
-            if isinstance(expr, pt.Einsum):
-                return pt.Einsum(
-                    expr.access_descriptors,
-                    tuple(arg.tagged(ImplSubstitution()) for arg in expr.args),
-                    expr.redn_axis_to_redn_descr,
-                    tags=expr.tags,
-                    axes=expr.axes,
-                )
-            elif isinstance(expr, pt.IndexLambda) and expr.var_to_reduction_descr:
-                return pt.IndexLambda(
-                    expr.expr,
-                    expr.shape,
-                    expr.dtype,
-                    Map(
-                        {
-                            name: bnd.tagged(ImplSubstitution())
-                            for name, bnd in expr.bindings.items()
-                        }
-                    ),
-                    expr.var_to_reduction_descr,
-                    tags=expr.tags,
-                    axes=expr.axes,
-                )
-            else:
-                return expr
-
-        dag = pt.transform.map_and_copy(
-            dag,
-            implement_einsum_reduction_inputs_as_substs,
-        )
-
-        return dag
-
-    def transform_loopy_program(self, t_unit: lp.TranslationUnit):
-        knl = t_unit.default_entrypoint
-        assert len(knl.instructions) == 1
-
-        # {{{ Put all basic sets into one domain. (easy for loopy transformations.)
-
-        intersected_domain = knl.domains[0]
-        for dom in knl.domains[1:]:
-            if set(intersected_domain.get_var_dict()) & set(dom.get_var_dict()):
-                raise RuntimeError("Intersecting all domains does not work.")
-
-            intersected_domain, dom = isl.align_two(intersected_domain, dom)
-            intersected_domain = intersected_domain & dom
-
-        knl = knl.copy(domains=[intersected_domain])
-        t_unit = t_unit.with_kernel(knl)
-
-        # }}}
-
-        einsum, _ = fnsm.get_a_matched_einsum(t_unit, long_dim_length=10_000)
-        facts_in_feinsum_db = fnsm.query(
-            einsum, self.queue.device, err_if_no_results=True
-        )
-        best_query = max(
-            facts_in_feinsum_db,
-            key=lambda q: sum(q.giga_op_info.values()) / q.runtime_in_sec,
-        )
-        t_unit = best_query.transform(t_unit)
-        return t_unit
+IBENCHMARKS = list(range(1, 49))
 
 
 def deconstruct_tccg_benchmark(
     ibenchmark,
-) -> tuple[str, tuple[tuple[int, ...], tuple[int, ...]]]:
+) -> tuple[str, tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]]:
     import feinsum.utils
 
     tensor_contraction = feinsum.utils.get_tccg_benchmark(ibenchmark)
     ((A, B),) = tensor_contraction.args
     A_shape = A.shape
     B_shape = B.shape
+    C_shape = tensor_contraction.shape
     assert all(isinstance(dim, int) for dim in A_shape)
     assert all(isinstance(dim, int) for dim in B_shape)
-    return tensor_contraction.get_subscripts(), (A_shape, B_shape)
+    assert all(isinstance(dim, int) for dim in C_shape)
+    return tensor_contraction.get_subscripts(), (A_shape, B_shape, C_shape)
 
 
 def f(
@@ -128,11 +46,62 @@ def f(
     actx: ArrayContext,
     ibenchmark: int,
 ) -> Array:
-    spec, (a_shape, b_shape) = deconstruct_tccg_benchmark(ibenchmark)
+    spec, (a_shape, b_shape, _) = deconstruct_tccg_benchmark(ibenchmark)
     assert a_shape == A.shape
     assert b_shape == B.shape
     assert A.dtype == np.float64 and B.dtype == np.float64
     return actx.einsum(spec, alpha1 * A + b1, alpha2 * B + b2)
+
+
+def get_untransformed_loopy_program_for_tccg(ibenchmark: int) -> lp.TranslationUnit:
+    from feinsum.codegen.loopy import _get_isl_basic_set
+    from feinsum.utils import get_tccg_benchmark
+    einsum = get_tccg_benchmark(ibenchmark)
+    a_subst_index = ", ".join(
+        f"_{idim}" for idim in range(len(einsum.arg_to_shape["A"]))
+    )
+    b_subst_index = ", ".join(
+        f"_{idim}" for idim in range(len(einsum.arg_to_shape["B"]))
+    )
+    out_idxs = ", ".join(einsum.out_idx_set)
+    sum_idxs = ", ".join(einsum.sum_indices)
+    in_idx1, in_idx2 = [", ".join(in_idx_set) for in_idx_set in einsum.in_idx_sets]
+    t_unit = lp.make_kernel(
+        [_get_isl_basic_set(einsum.index_to_dim_length)],
+        f"""
+        subst_A({a_subst_index}) := alpha1 * A[{a_subst_index}] + b1
+        subst_B({b_subst_index}) := alpha2 * B[{b_subst_index}] + b2
+
+        out[{out_idxs}] = sum([{sum_idxs}], subst_A({in_idx1}) * subst_B({in_idx2}))
+        """,
+        [
+            lp.ValueArg("alpha1", dtype=np.float64),
+            lp.ValueArg("b1", dtype=np.float64),
+            lp.GlobalArg("A", dtype=np.float64, shape=lp.auto),
+            lp.ValueArg("alpha2", dtype=np.float64),
+            lp.ValueArg("b2", dtype=np.float64),
+            lp.GlobalArg("B", dtype=np.float64, shape=lp.auto),
+            lp.GlobalArg("out", dtype=np.float64, shape=lp.auto),
+        ],
+        lang_version=(2018, 2),
+    )
+    return t_unit
+
+
+def get_loopy_program_for_tccg(
+    ibenchmark: int, queue: cl.CommandQueue
+) -> lp.TranslationUnit:
+    t_unit = get_untransformed_loopy_program_for_tccg(ibenchmark)
+    einsum, _ = fnsm.get_a_matched_einsum(t_unit, long_dim_length=10_000)
+    facts_in_feinsum_db = fnsm.query(
+        einsum, queue.device, err_if_no_results=True
+    )
+    best_query = max(
+        facts_in_feinsum_db,
+        key=lambda q: sum(q.giga_op_info.values()) / q.runtime_in_sec,
+    )
+    t_unit = best_query.transform(t_unit)
+    return t_unit
 
 
 def get_nflops_for_f(ibenchmark) -> int:
@@ -143,7 +112,7 @@ def get_nflops_for_f(ibenchmark) -> int:
     from feinsum.measure import _get_giga_ops_from_einsum
     from pytools import product
 
-    _, (A_shape, B_shape) = deconstruct_tccg_benchmark(ibenchmark)
+    _, (A_shape, B_shape, _) = deconstruct_tccg_benchmark(ibenchmark)
     flops_in_tc = (
         _get_giga_ops_from_einsum(feinsum.utils.get_tccg_benchmark(ibenchmark))[
             np.dtype(np.float64)
@@ -159,52 +128,41 @@ def get_n_footprint_bytes_for_f(ibenchmark) -> int:
     """
     from pytools import product
 
-    _, (A_shape, B_shape) = deconstruct_tccg_benchmark(ibenchmark)
-    return (product(A_shape) + product(B_shape)) * 8
+    _, (A_shape, B_shape, C_shape) = deconstruct_tccg_benchmark(ibenchmark)
+    return (product(A_shape) + product(B_shape) + product(C_shape)) * 8
 
 
-def create_array_context(which: str):
-    if which == "numpy":
-        return NumpyArrayContext()
-    elif which == "jax":
-        import jax
-
-        jax.config.update("jax_enable_x64", True)
-        return PytatoJAXArrayContext()
-    elif which == "feinsum":
-        import pyopencl as cl
-        import pyopencl.tools as cl_tools
-
-        ctx = cl.create_some_context()
-        cq = cl.CommandQueue(ctx)
-        allocator = cl_tools.MemoryPool(cl_tools.ImmediateAllocator(cq))
-        if cq.device.name != "NVIDIA TITAN V":
-            raise RuntimeError("This measurement script is written for Titan V.")
-
-        return FeinsumArrayContext(cq, allocator)
-    else:
-        raise ValueError()
+def get_roofline_flop_rate_for_f() -> tuple[float, ...]:
+    """
+    Returns a :class:`tuple`, ``flop_rate``, of 48 floating point values.
+    ``flop_rate[i]`` corresponds to the measured GFLOPS corresponding to the
+    computation of :func:`f` with the argument ``ibenchmark`` as ``i``.  During
+    the computation of the We assume the device here is the Nvidia Titan V.
+    """
+    roofline_gflops: list[float] = []
+    for ibenchmark in IBENCHMARKS:
+        ngflops = get_nflops_for_f(ibenchmark) * 1e-9
+        ngbytes = get_n_footprint_bytes_for_f(ibenchmark) * 1e-9
+        npeak_gflops = 6144  # GFLOPS
+        npeak_bw = 652.8  # GB/s
+        roofline_gflops.append(
+            ngflops / max(ngflops / npeak_gflops, ngbytes / npeak_bw),
+        )
+    return tuple(roofline_gflops)
 
 
-def sync_actx(actx: ArrayContext):
-    if isinstance(actx, NumpyArrayContext):
-        return
-    elif isinstance(actx, PytatoJAXArrayContext):
-        return
-    elif isinstance(actx, PytatoPyOpenCLArrayContext):
-        actx.queue.finish()
-        return
-    else:
-        raise ValueError(f"Unkown actx: {actx}.")
-
-
-def measure_flop_rate_for_f(actx: ArrayContext) -> tuple[float, ...]:
+def measure_flop_rate_for_f_w_jax() -> tuple[float, ...]:
     """
     Returns a :class:`tuple`, ``flop_rate``, of 48 floating point values.
     ``flop_rate[i]`` corresponds to the measured GFLOPS corresponding to the
     computation of :func:`f` with the argument ``ibenchmark`` as ``i``.
     """
     from functools import partial
+
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    actx = PytatoJAXArrayContext()
 
     from numpy.random import default_rng
 
@@ -213,13 +171,13 @@ def measure_flop_rate_for_f(actx: ArrayContext) -> tuple[float, ...]:
     alpha2 = rng.random(()).item()
     b1 = rng.random(()).item()
     b2 = rng.random(()).item()
-    actx_np = create_array_context("numpy")
+    actx_np = NumpyArrayContext()
     measured_gflops: list[float] = []
 
-    for ibenchmark in range(1, 49):
+    for ibenchmark in IBENCHMARKS:
         f_instance = partial(f, actx=actx, ibenchmark=ibenchmark)
         compiled_f = actx.compile(f_instance)
-        _, (A_shape, B_shape) = deconstruct_tccg_benchmark(ibenchmark)
+        _, (A_shape, B_shape, _) = deconstruct_tccg_benchmark(ibenchmark)
         A_np = rng.random(A_shape, dtype=np.float64)
         B_np = rng.random(B_shape, dtype=np.float64)
 
@@ -239,11 +197,9 @@ def measure_flop_rate_for_f(actx: ArrayContext) -> tuple[float, ...]:
         total_rounds = 0
         while total_time < 2:
             gc.collect()
-            sync_actx(actx)
             t_start = time()
             for _ in range(N_MIN_ROUNDS):
                 compiled_f(alpha1, b1, A_actx, alpha2, b2, B_actx)
-            sync_actx(actx)
             t_end = time()
             total_time += t_end - t_start
             total_rounds += N_MIN_ROUNDS
@@ -255,41 +211,116 @@ def measure_flop_rate_for_f(actx: ArrayContext) -> tuple[float, ...]:
     return tuple(measured_gflops)
 
 
-def get_roofline_flop_rate_for_f() -> tuple[float, ...]:
+def measure_flop_rate_for_f_w_feinsum() -> tuple[float, ...]:
     """
     Returns a :class:`tuple`, ``flop_rate``, of 48 floating point values.
     ``flop_rate[i]`` corresponds to the measured GFLOPS corresponding to the
-    computation of :func:`f` with the argument ``ibenchmark`` as ``i``.  During
-    the computation of the We assume the device here is the Nvidia Titan V.
+    computation of :func:`f` with the argument ``ibenchmark`` as ``i``.
     """
-    roofline_gflops: list[float] = []
-    for ibenchmark in range(1, 49):
-        ngflops = get_nflops_for_f(ibenchmark) * 1e-9
-        ngbytes = get_n_footprint_bytes_for_f(ibenchmark) * 1e-9
-        npeak_gflops = 6144  # GFLOPS
-        npeak_bw = 652.8  # GB/s
-        roofline_gflops.append(
-            ngflops / max(ngflops / npeak_gflops, ngbytes / npeak_bw),
+    import pyopencl.array as cla
+    ctx = cl.create_some_context()
+    cq = cl.CommandQueue(ctx)
+    if cq.device.name != "NVIDIA TITAN V":
+        raise RuntimeError("This script is only for evauating on a TITAN V.")
+
+    from numpy.random import default_rng
+
+    rng = default_rng(0)
+    alpha1 = rng.random(()).item()
+    alpha2 = rng.random(()).item()
+    b1 = rng.random(()).item()
+    b2 = rng.random(()).item()
+    actx_np = NumpyArrayContext()
+    measured_gflops: list[float] = []
+
+    for ibenchmark in IBENCHMARKS:
+        _, (A_shape, B_shape, out_shape) = deconstruct_tccg_benchmark(ibenchmark)
+        A_np = rng.random(A_shape, dtype=np.float64)
+        B_np = rng.random(B_shape, dtype=np.float64)
+
+        A_actx = cla.to_device(cq, A_np)
+        B_actx = cla.to_device(cq, B_np)
+        out_actx = cla.empty(cq, out_shape, dtype=np.float64)
+        allocator = cl_tools.MemoryPool(cl_tools.ImmediateAllocator(cq))
+
+        compiled_f = get_loopy_program_for_tccg(ibenchmark, cq).executor(
+            cq, alpha1, b1, A_actx, alpha2, b2, B_actx, out=out_actx,
+            allocator=allocator,
         )
-    return tuple(roofline_gflops)
+
+        for i in range(N_WARMUP_ROUNDS):
+            compiled_f(
+                cq,
+                alpha1=alpha1,
+                b1=b1,
+                A=A_actx,
+                alpha2=alpha2,
+                b2=b2,
+                B=B_actx,
+                out=out_actx,
+                allocator=allocator,
+            )
+            if i == 0:
+                out_np = f(
+                    alpha1,
+                    b1,
+                    A_np,
+                    alpha2,
+                    b2,
+                    B_np,
+                    actx=actx_np,
+                    ibenchmark=ibenchmark,
+                )
+                np.testing.assert_allclose(out_np, out_actx.get())
+
+        total_time = 0
+        total_rounds = 0
+        while total_time < 2:
+            cq.finish()
+            t_start = time()
+            for _ in range(N_MIN_ROUNDS):
+                compiled_f(
+                    cq,
+                    alpha1=alpha1,
+                    b1=b1,
+                    A=A_actx,
+                    alpha2=alpha2,
+                    b2=b2,
+                    B=B_actx,
+                    out=out_actx,
+                    allocator=allocator,
+                )
+            cq.finish()
+            t_end = time()
+            total_time += t_end - t_start
+            total_rounds += N_MIN_ROUNDS
+
+        avg_time = total_time / total_rounds
+        ngflops = get_nflops_for_f(ibenchmark) * 1e-9
+        measured_gflops.append(ngflops / avg_time)
+        print(f"Done within {ibenchmark = } with Feinsum.")
+    return tuple(measured_gflops)
 
 
 def main():
-    feinsum_gflops = measure_flop_rate_for_f(create_array_context("feinsum"))
+    feinsum_gflops = measure_flop_rate_for_f_w_feinsum()
     gc.collect()
-    jax_gflops = measure_flop_rate_for_f(create_array_context("jax"))
+    jax_gflops = measure_flop_rate_for_f_w_jax()
     gc.collect()
     roofline_gflops = get_roofline_flop_rate_for_f()
 
-    table = np.empty((48, 3))
-    table[:, 0] = jax_gflops
-    table[:, 1] = feinsum_gflops
-    table[:, 2] = roofline_gflops
+    table = np.empty((len(IBENCHMARKS), 5))
+    table[:, 0] = IBENCHMARKS
+    table[:, 1] = jax_gflops
+    table[:, 2] = feinsum_gflops
+    table[:, 3] = roofline_gflops
+    table[:, 4] = table[:, 2] / table[:, 1]
 
     print(
         tabulate(
             table,
-            headers=["JAX GFLOPS", "Feinsum GFLOPS", "Roofline GFLOPS"],
+            headers=["ibenchmark", "JAX GFLOPS", "Feinsum GFLOPS",
+                     "Roofline GFLOPS", "Feinsum speedup"],
             tablefmt="fancy",
         )
     )
