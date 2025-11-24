@@ -1,152 +1,347 @@
-import argparse
+import gc
+import itertools
+from collections.abc import Mapping
+from time import time
+
+import feinsum as fnsm
+import loopy as lp
 import numpy as np
-from arraycontext import (ArrayContext, ArrayT, tag_axes, PyOpenCLArrayContext,
-                          PytatoJAXArrayContext, EagerJAXArrayContext)
-from bidict import bidict
+import pyopencl as cl
+import pyopencl.tools as cl_tools
+from arraycontext import (
+    ArrayContext,
+    ArrayT,
+    NumpyArrayContext,
+    PytatoJAXArrayContext,
+)
+from pytools.obj_array import ObjectArray1D, new_1d
 from tabulate import tabulate
 
-from typing import Sequence, Type
-from pytools.obj_array import make_obj_array
-from feinsum_evaluation.metadata import NamedAxis
-from feinsum_evaluation.utils import (get_actx_t_priority, instantiate_actx_t,
-                                      get_wallclock_time,
-                                      BatchedEinsumPytatoPyOpenCLArrayContext)
+N_WARMUP_ROUNDS = 3
+N_MIN_ROUNDS = 10
+VARIANTS = [1, 2, 3, 4]
+BATCHES = [3, 4, 5, 6, 19]
 
 
-def kernel(actx: ArrayContext,
-           flux_terms_p: Sequence[ArrayT],
-           flux_terms_n: Sequence[ArrayT],
-           ref_mat: ArrayT,
-           jac: ArrayT) -> np.array:
-    ref_mat = tag_axes(actx,
-                       {0: NamedAxis("voldof"),
-                        1: NamedAxis("face"),
-                        2: NamedAxis("facedof")},
-                       ref_mat)
-    jac = tag_axes(actx,
-                   {0: NamedAxis("face"),
-                    1: NamedAxis("element")},
-                   jac)
-
-    flux_terms_p = [tag_axes(actx,
-                             {0: NamedAxis("face"),
-                              1: NamedAxis("element"),
-                              2: NamedAxis("facedof")},
-                             flux)
-                    for flux in flux_terms_p]
-
-    flux_terms_n = [tag_axes(actx,
-                             {0: NamedAxis("face"),
-                              1: NamedAxis("element"),
-                              2: NamedAxis("facedof")},
-                             flux)
-                    for flux in flux_terms_n]
-
-    sub_results = [
-        actx.einsum("ifj,fe,fej->ei",
-                    ref_mat, jac, 0.5 * (flux_n + flux_p))
-        for flux_p, flux_n in zip(flux_terms_p, flux_terms_n, strict=True)
-    ]
-
-    return make_obj_array(sub_results)
-
-
-def get_nel(ni: int):
-    if ni == 4:
-        return 200_000
-    elif ni == 10:
-        return 200_000
-    elif ni == 20:
-        return 100_000
-    elif ni == 35:
-        return 80_000
+def get_dims_for_variant(variant: int) -> Mapping[str, int]:
+    if variant == 1:
+        return {"i": 4, "e": 200_000, "f": 4, "j": 3}
+    elif variant == 2:
+        return {"i": 10, "e": 200_000, "f": 4, "j": 6}
+    elif variant == 3:
+        return {"i": 20, "e": 100_000, "f": 4, "j": 10}
+    elif variant == 4:
+        return {"i": 35, "e": 80_000, "f": 4, "j": 15}
     else:
-        raise NotImplementedError()
+        raise ValueError(f"variant must be one of {{1, 2, 3, 4}}, got {variant}.")
 
 
-def main(*,
-         actx_ts: Sequence[Type[ArrayContext]],
-         batches: Sequence[int],
-         ni: int,
-         nj: int) -> None:
-
-    timings = np.empty((len(batches), len(actx_ts)), dtype=np.float64)
-    nel = get_nel(ni)
-
-    # sorting `actx_ts` to run JAX related operations at the end as they only
-    # free the device memory atexit
-    for iactx_t, actx_t in sorted(enumerate(actx_ts),
-                                  key=lambda k: get_actx_t_priority(k[1])):
-        actx = instantiate_actx_t(actx_t)
-        for ibatch, n in enumerate(batches):
-            ref_mat = actx.from_numpy(np.random.rand(ni, 4, nj))
-            jac = actx.from_numpy(np.random.rand(4, nel))
-            compiled_knl = actx.compile(lambda *args: kernel(actx, *args))
-
-            wallclock_time = get_wallclock_time(
-                compiled_knl,
-                (
-                    make_obj_array([
-                        actx.from_numpy(np.random.rand(4, nel, nj))
-                        for _ in range(n)]),
-                    make_obj_array([
-                        actx.from_numpy(np.random.rand(4, nel, nj))
-                        for _ in range(n)]),
-                    ref_mat,
-                    jac,
-                ),
-            )
-
-            timings[ibatch, iactx_t] = wallclock_time
-
-    table = [["",
-              *[_NAME_TO_ACTX_CLASS.inv[actx_t]
-                for actx_t in actx_ts]]]
-    for ibatch, n in enumerate(batches):
-        table.append([str(n)] + [f"{timings[ibatch, iactx_t]:.4f}"
-                                 for iactx_t in range(len(actx_ts))])
-
-    print(tabulate(table, tablefmt="fancy_grid"))
-
-
-_NAME_TO_ACTX_CLASS = bidict({
-    "pyopencl": PyOpenCLArrayContext,
-    "jax:nojit": EagerJAXArrayContext,
-    "jax:jit": PytatoJAXArrayContext,
-    "pytato:batched_einsum": BatchedEinsumPytatoPyOpenCLArrayContext,
-})
-
-if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser(
-        prog="ifj_fe_fej_to_ei.py",
-        description="Run batched ifj_fe_fej_to_ei benchmarks for arraycontexts",
+def f(
+    ref_mat: ArrayT,
+    jac: ArrayT,
+    flux_terms_p: ObjectArray1D[ArrayT],
+    flux_terms_n: ObjectArray1D[ArrayT],
+    actx: ArrayContext,
+) -> ObjectArray1D[ArrayT]:
+    return new_1d(
+        [
+            actx.einsum("ifj,fe,fej->ei", ref_mat, jac, 0.5 * (flux_n + flux_p))
+            for flux_p, flux_n in zip(flux_terms_p, flux_terms_n, strict=True)
+        ]
     )
 
-    parser.add_argument("--actxs", metavar="A", type=str,
-                        help=("comma separated integers representing the"
-                              " array context types"
-                              " to run the benchmark with (for ex."
-                              " 'pyopencl,jax:jit,pytato:batched_einsum')"),
-                        required=True,)
 
-    parser.add_argument("--batches", metavar="N", type=str,
-                        help=("comma separated integers representing the"
-                              " #batches to run"
-                              " to run the benchmark with (for ex."
-                              " '3, 4, 8, 16')"),
-                        required=True,)
+def get_nflops_for_f(variant: int, b: int) -> int:
+    import opt_einsum as op
+    from pytools import product
 
-    parser.add_argument("--ni", type=int,
-                        help="loop-length of `i`.",
-                        required=True,)
+    dims = get_dims_for_variant(variant)
+    D_shape = (dims["i"], dims["f"], dims["j"])
+    J_shape = (dims["f"], dims["e"])
+    u_shape = (dims["f"], dims["e"], dims["j"])
+    _, path_info = op.contract_path(
+        "ifj,fe,fej->ei",
+        fnsm.array("D", D_shape),
+        fnsm.array("J", J_shape),
+        fnsm.array("u", u_shape),
+        optimize="optimal",
+    )
+    return (int(path_info.opt_cost) + 2 * product(u_shape)) * b
 
-    parser.add_argument("--nj", type=int,
-                        help="loop-length of `j`.",
-                        required=True,)
 
-    args = parser.parse_args()
-    main(batches=[int(k.strip()) for k in args.batches.split(",")],
-         actx_ts=[_NAME_TO_ACTX_CLASS[k] for k in args.actxs.split(",")],
-         ni=args.ni,
-         nj=args.nj)
+def untransformed_loopy_kernel(
+    variant: int,
+    b: int,
+) -> lp.TranslationUnit:
+    from loopy.symbolic import parse
+
+    dims = get_dims_for_variant(variant)
+
+    insns = [
+        lp.Assignment(
+            parse(f"out_{ib}[e, i]"),
+            parse(
+                "sum([f, j], D_subst(i, f, j) * J_subst(f, e)"
+                f" * flux_{ib}_subst(f, e, j))"
+            ),
+            within_inames=frozenset({"e", "i"}),
+        )
+        for ib in range(b)
+    ]
+
+    substs = [
+        lp.SubstitutionRule(
+            "D_subst", ["d_0", "d_1", "d_2"], parse("D[d_0, d_1, d_2]")
+        ),
+        lp.SubstitutionRule("J_subst", ["d_0", "d_1"], parse("J[d_0, d_1]")),
+        *[
+            lp.SubstitutionRule(
+                f"flux_{ib}_subst",
+                ["d_0", "d_1", "d_2"],
+                parse(f"0.5*(fp_{ib}[d_0, d_1, d_2] + fn_{ib}[d_0, d_1, d_2])"),
+            )
+            for ib in range(b)
+        ],
+    ]
+
+    t_unit = lp.make_kernel(
+        f"{{ [e,f,i,j] : 0<=e<{dims['e']} and 0<=f<{dims['f']} and 0<=i<{dims['i']}"
+        f" and 0<=j<{dims['j']} }}",
+        insns + substs,
+        [
+            lp.GlobalArg(
+                "D",
+                dtype=np.float64,
+                shape=lp.auto,
+            ),
+            lp.GlobalArg(
+                "J",
+                dtype=np.float64,
+                shape=lp.auto,
+            ),
+            lp.GlobalArg(
+                ",".join(f"fn_{ib}" for ib in range(b)),
+                dtype=np.float64,
+                shape=lp.auto,
+            ),
+            lp.GlobalArg(
+                ",".join(f"fp_{ib}" for ib in range(b)),
+                dtype=np.float64,
+                shape=lp.auto,
+            ),
+            lp.GlobalArg(
+                ",".join(f"out_{ib}" for ib in range(b)),
+                dtype=np.float64,
+                shape=lp.auto,
+            ),
+        ],
+        lang_version=(2018, 2),
+    )
+    return t_unit
+
+
+def get_loopy_program_for_facemass(
+    variant: int, b: int, queue: cl.CommandQueue
+) -> lp.TranslationUnit:
+    t_unit = untransformed_loopy_kernel(variant, b)
+    einsum, _ = fnsm.get_a_matched_einsum(t_unit, long_dim_length=1_000)
+    facts_in_feinsum_db = fnsm.query(einsum, queue.device, err_if_no_results=True)
+    best_query = max(
+        facts_in_feinsum_db,
+        key=lambda q: sum(q.giga_op_info.values()) / q.runtime_in_sec,
+    )
+    t_unit = best_query.transform(t_unit)
+    return t_unit
+
+
+def measure_flop_rate_for_f_w_feinsum() -> Mapping[tuple[int, int], float]:
+    import pyopencl.array as cla
+
+    ctx = cl.create_some_context()
+    cq = cl.CommandQueue(ctx)
+    if cq.device.name != "NVIDIA TITAN V":
+        raise RuntimeError("This script is only for evauating on a TITAN V.")
+
+    from numpy.random import default_rng
+
+    rng = default_rng(0)
+    actx_np = NumpyArrayContext()
+    measured_gflops: dict[tuple[int, int], float] = {}
+
+    for variant, b in itertools.product(VARIANTS, BATCHES):
+        dims = get_dims_for_variant(variant)
+        f_n_nps = [rng.random((dims["f"], dims["e"], dims["j"])) for _ in range(b)]
+        f_p_nps = [rng.random((dims["f"], dims["e"], dims["j"])) for _ in range(b)]
+        D_np = rng.random((dims["i"], dims["f"], dims["j"]))
+        J_np = rng.random((dims["f"], dims["e"]))
+
+        f_n_cls = [cla.to_device(cq, f_n_np) for f_n_np in f_n_nps]
+        f_p_cls = [cla.to_device(cq, f_n_np) for f_n_np in f_p_nps]
+        D_cl = cla.to_device(cq, D_np)
+        J_cl = cla.to_device(cq, J_np)
+        out_cls = [
+            cla.empty(cq, (dims["e"], dims["i"]), dtype=np.float64) for _ in range(b)
+        ]
+        allocator = cl_tools.MemoryPool(cl_tools.ImmediateAllocator(cq))
+
+        compiled_f = get_loopy_program_for_facemass(variant, b, cq).executor(
+            cq,
+            D_cl,
+            J_cl,
+            *f_n_cls,
+            *f_p_cls,
+            *out_cls,
+            entrypoint=None,
+            allocator=allocator,
+        )
+
+        for i in range(N_WARMUP_ROUNDS):
+            compiled_f(
+                cq,
+                D=D_cl,
+                J=J_cl,
+                **{f"fn_{ib}": f_n_cl for ib, f_n_cl in enumerate(f_n_cls)},
+                **{f"fp_{ib}": f_p_cl for ib, f_p_cl in enumerate(f_p_cls)},
+                **{f"out_{ib}": out_cl for ib, out_cl in enumerate(out_cls)},
+                allocator=allocator,
+            )
+            if i == 0:
+                out_nps = f(
+                    D_np,
+                    J_np,
+                    new_1d(f_n_nps),
+                    new_1d(f_p_nps),
+                    actx=actx_np,
+                )
+                for out_np, out_cl in zip(out_nps, out_cls, strict=True):
+                    np.testing.assert_allclose(out_np, out_cl.get())
+
+        total_time = 0
+        total_rounds = 0
+        while total_time < 2:
+            cq.finish()
+            t_start = time()
+            for _ in range(N_MIN_ROUNDS):
+                compiled_f(
+                    cq,
+                    D=D_cl,
+                    J=J_cl,
+                    **{f"fn_{ib}": f_n_cl for ib, f_n_cl in enumerate(f_n_cls)},
+                    **{f"fp_{ib}": f_p_cl for ib, f_p_cl in enumerate(f_p_cls)},
+                    **{f"out_{ib}": out_cl for ib, out_cl in enumerate(out_cls)},
+                    allocator=allocator,
+                )
+            cq.finish()
+            t_end = time()
+            total_time += t_end - t_start
+            total_rounds += N_MIN_ROUNDS
+
+        avg_time = total_time / total_rounds
+        ngflops = get_nflops_for_f(variant, b) * 1e-9
+        measured_gflops[variant, b] = ngflops / avg_time
+        print(f"Done within {variant = }, {b = } with Feinsum.")
+
+    return measured_gflops
+
+
+def measure_flop_rate_for_f_w_jax() -> Mapping[tuple[int, int], float]:
+    from functools import partial
+
+    import jax
+    from numpy.random import default_rng
+
+    jax.config.update("jax_enable_x64", True)
+
+    actx = PytatoJAXArrayContext()
+    actx_np = NumpyArrayContext()
+    rng = default_rng(0)
+    measured_gflops: dict[tuple[int, int], float] = {}
+
+    for variant, b in itertools.product(VARIANTS, BATCHES):
+        dims = get_dims_for_variant(variant)
+        f_n_nps = [rng.random((dims["f"], dims["e"], dims["j"])) for _ in range(b)]
+        f_p_nps = [rng.random((dims["f"], dims["e"], dims["j"])) for _ in range(b)]
+        D_np = rng.random((dims["i"], dims["f"], dims["j"]))
+        J_np = rng.random((dims["f"], dims["e"]))
+
+        f_n_actxs = new_1d([actx.from_numpy(f_n_np) for f_n_np in f_n_nps])
+        f_p_actxs = new_1d([actx.from_numpy(f_n_np) for f_n_np in f_p_nps])
+        D_actx = actx.from_numpy(D_np)
+        J_actx = actx.from_numpy(J_np)
+
+        compiled_f = actx.compile(partial(f, actx=actx))
+
+        for i in range(N_WARMUP_ROUNDS):
+            out_actxs = compiled_f(
+                D_actx,
+                J_actx,
+                f_n_actxs,
+                f_p_actxs,
+            )
+            if i == 0:
+                out_nps = f(
+                    D_np,
+                    J_np,
+                    new_1d(f_n_nps),
+                    new_1d(f_p_nps),
+                    actx=actx_np,
+                )
+                for out_np, out_actx in zip(out_nps, out_actxs, strict=True):
+                    np.testing.assert_allclose(out_np, actx.to_numpy(out_actx))
+
+        total_time = 0
+        total_rounds = 0
+        while total_time < 2:
+            gc.collect()
+            t_start = time()
+            for _ in range(N_MIN_ROUNDS):
+                compiled_f(
+                    D_actx,
+                    J_actx,
+                    f_n_actxs,
+                    f_p_actxs,
+                )
+            t_end = time()
+            total_time += t_end - t_start
+            total_rounds += N_MIN_ROUNDS
+
+        avg_time = total_time / total_rounds
+        ngflops = get_nflops_for_f(variant, b) * 1e-9
+        measured_gflops[variant, b] = ngflops / avg_time
+        print(f"Done within {variant = }, {b = } with JAX.")
+
+    return measured_gflops
+
+
+def main():
+    feinsum_gflops = measure_flop_rate_for_f_w_feinsum()
+    gc.collect()
+    jax_gflops = measure_flop_rate_for_f_w_jax()
+    gc.collect()
+
+    table = [
+        [
+            id_,
+            jax_gflops[id_],
+            feinsum_gflops[id_],
+            feinsum_gflops[id_] / jax_gflops[id_],
+        ]
+        for id_ in sorted(itertools.product(VARIANTS, BATCHES))
+    ]
+
+    print(
+        tabulate(
+            table,
+            headers=[
+                "ibenchmark",
+                "JAX GFLOPS",
+                "Feinsum GFLOPS",
+                "Feinsum speedup",
+            ],
+            tablefmt="fancy",
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
