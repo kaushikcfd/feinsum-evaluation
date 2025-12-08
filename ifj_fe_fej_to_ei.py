@@ -39,21 +39,16 @@ def get_dims_for_variant(variant: int) -> Mapping[str, int]:
 def f(
     ref_mat: ArrayT,
     jac: ArrayT,
-    flux_terms_p: ObjectArray1D[ArrayT],
-    flux_terms_n: ObjectArray1D[ArrayT],
+    flux_terms: ObjectArray1D[ArrayT],
     actx: ArrayContext,
 ) -> ObjectArray1D[ArrayT]:
     return new_1d(
-        [
-            actx.einsum("ifj,fe,fej->ei", ref_mat, jac, 0.5 * (flux_n + flux_p))
-            for flux_p, flux_n in zip(flux_terms_p, flux_terms_n, strict=True)
-        ]
+        [actx.einsum("ifj,fe,fej->ei", ref_mat, jac, flux) for flux in flux_terms]
     )
 
 
 def get_nflops_for_f(variant: int, b: int) -> int:
     import opt_einsum as op
-    from pytools import product
 
     dims = get_dims_for_variant(variant)
     D_shape = (dims["i"], dims["f"], dims["j"])
@@ -66,7 +61,7 @@ def get_nflops_for_f(variant: int, b: int) -> int:
         fnsm.array("u", u_shape),
         optimize="optimal",
     )
-    return (int(path_info.opt_cost) + 2 * product(u_shape)) * b
+    return int(path_info.opt_cost) * b
 
 
 def untransformed_loopy_kernel(
@@ -98,7 +93,7 @@ def untransformed_loopy_kernel(
             lp.SubstitutionRule(
                 f"flux_{ib}_subst",
                 ["d_0", "d_1", "d_2"],
-                parse(f"0.5*(fp_{ib}[d_0, d_1, d_2] + fn_{ib}[d_0, d_1, d_2])"),
+                parse(f"(f_{ib}[d_0, d_1, d_2])"),
             )
             for ib in range(b)
         ],
@@ -120,12 +115,7 @@ def untransformed_loopy_kernel(
                 shape=lp.auto,
             ),
             lp.GlobalArg(
-                ",".join(f"fn_{ib}" for ib in range(b)),
-                dtype=np.float64,
-                shape=lp.auto,
-            ),
-            lp.GlobalArg(
-                ",".join(f"fp_{ib}" for ib in range(b)),
+                ",".join(f"f_{ib}" for ib in range(b)),
                 dtype=np.float64,
                 shape=lp.auto,
             ),
@@ -170,13 +160,11 @@ def measure_flop_rate_for_f_w_feinsum() -> Mapping[tuple[int, int], float]:
 
     for variant, b in itertools.product(VARIANTS, BATCHES):
         dims = get_dims_for_variant(variant)
-        f_n_nps = [rng.random((dims["f"], dims["e"], dims["j"])) for _ in range(b)]
-        f_p_nps = [rng.random((dims["f"], dims["e"], dims["j"])) for _ in range(b)]
+        flux_nps = [rng.random((dims["f"], dims["e"], dims["j"])) for _ in range(b)]
         D_np = rng.random((dims["i"], dims["f"], dims["j"]))
         J_np = rng.random((dims["f"], dims["e"]))
 
-        f_n_cls = [cla.to_device(cq, f_n_np) for f_n_np in f_n_nps]
-        f_p_cls = [cla.to_device(cq, f_n_np) for f_n_np in f_p_nps]
+        flux_cls = [cla.to_device(cq, flux_np) for flux_np in flux_nps]
         D_cl = cla.to_device(cq, D_np)
         J_cl = cla.to_device(cq, J_np)
         out_cls = [
@@ -188,8 +176,7 @@ def measure_flop_rate_for_f_w_feinsum() -> Mapping[tuple[int, int], float]:
             cq,
             D_cl,
             J_cl,
-            *f_n_cls,
-            *f_p_cls,
+            *flux_cls,
             *out_cls,
             entrypoint=None,
             allocator=allocator,
@@ -200,8 +187,7 @@ def measure_flop_rate_for_f_w_feinsum() -> Mapping[tuple[int, int], float]:
                 cq,
                 D=D_cl,
                 J=J_cl,
-                **{f"fn_{ib}": f_n_cl for ib, f_n_cl in enumerate(f_n_cls)},
-                **{f"fp_{ib}": f_p_cl for ib, f_p_cl in enumerate(f_p_cls)},
+                **{f"f_{ib}": flux_cl for ib, flux_cl in enumerate(flux_cls)},
                 **{f"out_{ib}": out_cl for ib, out_cl in enumerate(out_cls)},
                 allocator=allocator,
             )
@@ -209,8 +195,7 @@ def measure_flop_rate_for_f_w_feinsum() -> Mapping[tuple[int, int], float]:
                 out_nps = f(
                     D_np,
                     J_np,
-                    new_1d(f_n_nps),
-                    new_1d(f_p_nps),
+                    new_1d(flux_nps),
                     actx=actx_np,
                 )
                 for out_np, out_cl in zip(out_nps, out_cls, strict=True):
@@ -226,8 +211,7 @@ def measure_flop_rate_for_f_w_feinsum() -> Mapping[tuple[int, int], float]:
                     cq,
                     D=D_cl,
                     J=J_cl,
-                    **{f"fn_{ib}": f_n_cl for ib, f_n_cl in enumerate(f_n_cls)},
-                    **{f"fp_{ib}": f_p_cl for ib, f_p_cl in enumerate(f_p_cls)},
+                    **{f"f_{ib}": flux_cl for ib, flux_cl in enumerate(flux_cls)},
                     **{f"out_{ib}": out_cl for ib, out_cl in enumerate(out_cls)},
                     allocator=allocator,
                 )
@@ -259,13 +243,13 @@ def measure_flop_rate_for_f_w_jax() -> Mapping[tuple[int, int], float]:
 
     for variant, b in itertools.product(VARIANTS, BATCHES):
         dims = get_dims_for_variant(variant)
-        f_n_nps = [rng.random((dims["f"], dims["e"], dims["j"])) for _ in range(b)]
-        f_p_nps = [rng.random((dims["f"], dims["e"], dims["j"])) for _ in range(b)]
+        flux_nps = new_1d(
+            [rng.random((dims["f"], dims["e"], dims["j"])) for _ in range(b)]
+        )
         D_np = rng.random((dims["i"], dims["f"], dims["j"]))
         J_np = rng.random((dims["f"], dims["e"]))
 
-        f_n_actxs = new_1d([actx.from_numpy(f_n_np) for f_n_np in f_n_nps])
-        f_p_actxs = new_1d([actx.from_numpy(f_n_np) for f_n_np in f_p_nps])
+        flux_actxs = actx.from_numpy(flux_nps)
         D_actx = actx.from_numpy(D_np)
         J_actx = actx.from_numpy(J_np)
 
@@ -275,15 +259,13 @@ def measure_flop_rate_for_f_w_jax() -> Mapping[tuple[int, int], float]:
             out_actxs = compiled_f(
                 D_actx,
                 J_actx,
-                f_n_actxs,
-                f_p_actxs,
+                flux_actxs,
             )
             if i == 0:
                 out_nps = f(
                     D_np,
                     J_np,
-                    new_1d(f_n_nps),
-                    new_1d(f_p_nps),
+                    flux_nps,
                     actx=actx_np,
                 )
                 for out_np, out_actx in zip(out_nps, out_actxs, strict=True):
@@ -298,8 +280,7 @@ def measure_flop_rate_for_f_w_jax() -> Mapping[tuple[int, int], float]:
                 compiled_f(
                     D_actx,
                     J_actx,
-                    f_n_actxs,
-                    f_p_actxs,
+                    flux_actxs,
                 )
             t_end = time()
             total_time += t_end - t_start
